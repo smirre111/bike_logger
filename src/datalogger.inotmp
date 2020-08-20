@@ -1,0 +1,858 @@
+/*
+ * Connect the SD card to the following pins:
+ *
+ * SD Card | ESP32
+ *    D2       -
+ *    D3       SS
+ *    CMD      MOSI
+ *    VSS      GND
+ *    VDD      3.3V
+ *    CLK      SCK
+ *    VSS      GND
+ *    D0       MISO
+ *    D1       -
+ */
+
+#include "Arduino.h"
+
+//#define ADAF
+//#define SERVER
+//#define MYWIFI
+#define DISTANCE
+#define ACCEL
+#ifdef ESP8266
+#include <ESP8266WiFi.h>      // Built-in
+#include <ESP8266WiFiMulti.h> // Built-in
+#include <ESP8266WebServer.h> // Built-in
+#include <ESP8266mDNS.h>
+#else
+#include <WiFi.h>           // Built-in
+#include <WiFiMulti.h>      // Built-in
+#include <ESP32WebServer.h> // https://github.com/Pedroalbuquerque/ESP32WebServer download and place in your Libraries folder
+//#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+#include "FS.h"
+#endif
+
+#include "Network.h"
+#include "Sys_Variables.h"
+//#include "CSS.h"
+#include <SD.h>
+#include <SPI.h>
+#include "sd_fs_functions.h"
+
+
+
+#ifdef MYWIFI
+#ifdef ESP8266
+ESP8266WiFiMulti wifiMulti;
+#else
+WiFiMulti wifiMulti;
+#endif
+#endif
+
+#ifdef SERVER
+#ifdef ESP8266
+ESP8266WebServer server(80);
+#else
+ESP32WebServer server(80);
+#endif
+#endif
+
+#include "FS.h"
+#include <Wire.h>
+//#include <WiFiUdp.h>
+#include "AsyncUDP.h"
+#include "Adafruit_VL6180X.h"
+#include <VL6180X.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+#ifdef SERVER
+#include "ws_functions.h"
+#endif
+
+Adafruit_MPU6050 mpu;
+#ifdef ADAF
+Adafruit_VL6180X vl = Adafruit_VL6180X();
+#else
+VL6180X vl1;
+
+#endif
+#ifdef DISTANCE
+TwoWire *theWire = NULL;
+TwoWire *_i2c;
+#endif
+File logFile;
+
+TaskHandle_t hServer;
+TaskHandle_t hSensor;
+TaskHandle_t hLoop;
+
+#ifdef ADAF
+uint8_t range;
+#else
+uint16_t range1;
+#endif
+uint8_t status;
+
+struct logger_t
+{
+  float range;
+  float x;
+  float y;
+  float z;
+};
+
+#define SAMPLES 128
+
+logger_t logData[SAMPLES];
+logger_t logDataDbl[SAMPLES];
+
+const size_t SZ = sizeof(logger_t) * SAMPLES;
+uint8_t buf[SZ];
+
+File myFileIn;
+File myFileOut;
+
+TickType_t testTicks;
+
+SemaphoreHandle_t xMutex;
+
+unsigned int localPort = 2390; // local port to listen on
+
+char packetBuffer[255];                   //buffer to hold incoming packet
+uint8_t ReplyBuffer[50] = "acknowledged"; // a string to send back
+
+//WiFiUDP udp;
+AsyncUDP udp;
+IPAddress remote_IP(192, 168, 178, 30);
+
+uint16_t millis_last;
+uint16_t millis_cur;
+
+#ifndef ADAF
+bool rangeDataReady()
+{
+  return ((vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO) & 0x04) != 0);
+}
+
+uint8_t readRangeNonBlocking()
+{
+  uint8_t range = vl1.readReg(VL6180X::RESULT__RANGE_VAL);
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x01);
+
+  return range;
+}
+
+uint8_t readRangeNonBlockingMillimeters()
+{
+  return readRangeNonBlocking() * vl1.getScaling();
+}
+
+// bool rangeDataReady()
+// {
+//   uint8_t stt = vl1.readReg(VL6180X::RESULT__RANGE_STATUS);
+//   uint16_t status = vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO);
+//   uint16_t ready = (status & 0x0004);
+//   //return ((vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO) & 0x04) != 0);
+//   while(ready == 0) {
+//     Serial.print("Status :");
+//     Serial.println(status);
+//     Serial.print("Status :");
+//     Serial.println(stt);
+//     Serial.print("Range status: ");
+//     Serial.print(status & 0x0007);
+//     Serial.print(" ALS status: ");
+//     Serial.print(status & 0x0038);
+//     Serial.print(" Error status: ");
+//     Serial.println(status & 0x00C0);
+
+//     stt = vl1.readReg(VL6180X::RESULT__RANGE_STATUS);
+//     status = vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO);
+//     ready = (status & 0x04);
+//   }
+//   return true;
+// }
+
+// uint8_t readRangeNonBlocking()
+// {
+//   Serial.println("Reading range");
+//   uint8_t range = vl1.readReg(VL6180X::RESULT__RANGE_VAL);
+//   //vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x01);
+//   vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x07);
+
+//   return range;
+// }
+
+// uint8_t readRangeNonBlockingMillimeters()
+// {
+//   return readRangeNonBlocking() * vl1.getScaling();
+// }
+
+#endif
+
+void setup()
+{
+  //Starting serial
+  Serial.begin(115200);
+
+#ifdef MYWIFI
+
+  // Setting up WiFi ************************************************************
+  //*****************************************************************************
+  if (!WiFi.config(local_IP, gateway, subnet, dns))
+  { //WiFi.config(ip, gateway, subnet, dns1, dns2);
+    Serial.println("WiFi STATION Failed to configure Correctly");
+  }
+  wifiMulti.addAP(ssid_1, password_1); // add Wi-Fi networks you want to connect to, it connects strongest to weakest
+  wifiMulti.addAP(ssid_2, password_2); // Adjust the values in the Network tab
+  wifiMulti.addAP(ssid_3, password_3);
+  wifiMulti.addAP(ssid_4, password_4); // You don't need 4 entries, this is for example!
+
+  Serial.println("Connecting ...");
+  while (wifiMulti.run() != WL_CONNECTED)
+  { // Wait for the Wi-Fi to connect: scan for Wi-Fi networks, and connect to the strongest of the networks above
+    delay(250);
+    Serial.print('.');
+  }
+
+  // Setting up Udp ************************************************************
+  //*****************************************************************************
+  Serial.println("\nStarting connection to server...");
+  // if you get a connection, report back via serial:
+  //udp.begin(localPort);
+
+  // Setting up mDNS for the webserver ************************************************************
+  //*****************************************************************************
+  Serial.println("\nConnected to " + WiFi.SSID() + " Use IP address: " + WiFi.localIP().toString()); // Report which SSID and IP is in use
+  // The logical name http://fileserver.local will also access the device if you have 'Bonjour' running or your system supports multicast dns
+  if (!MDNS.begin(servername))
+  { // Set your preferred server name, if you use "myserver" the address would be http://myserver.local/
+    Serial.println(F("Error setting up MDNS responder!"));
+    ESP.restart();
+  }
+  MDNS.addService("http", "tcp", 80);
+#endif
+  // Setting up SD Card ************************************************************
+  //*****************************************************************************
+
+#ifdef ESP32
+  // Note: SD_Card readers on the ESP32 will NOT work unless there is a pull-up on MISO, either do this or wire one on (1K to 4K7)
+  Serial.println(MISO);
+  pinMode(19, INPUT_PULLUP);
+#endif
+
+  Serial.print(F("Initializing SD card..."));
+  if (!SD.begin(SD_CS_pin))
+  { // see if the card is present and can be initialised. Wemos SD-Card CS uses D8
+    Serial.println(F("Card failed or not present, no SD Card data logging possible..."));
+    SD_present = false;
+  }
+  else
+  {
+    Serial.println(F("Card initialised... file access enabled..."));
+    SD_present = true;
+  }
+
+#ifdef SERVER
+  // Setting up WebServer ************************************************************
+  // //*****************************************************************************
+  // // Note: Using the ESP32 and SD_Card readers requires a 1K to 4K7 pull-up to 3v3 on the MISO line, otherwise they do-not function.
+  // //----------------------------------------------------------------------
+  // ///////////////////////////// Server Commands
+  server.on("/", HomePage);
+  server.on("/download", File_Download);
+  server.on("/upload", File_Upload);
+  server.on("/fupload", HTTP_POST, []() { server.send(200); }, handleFileUpload);
+  ///////////////////////////// End of Request commands
+  server.begin();
+  Serial.println("HTTP server started");
+#endif
+
+  // Getting some SD card tests *************************************************
+  //*****************************************************************************
+  if (!SD.begin())
+  {
+    Serial.println("Card Mount Failed");
+    return;
+  }
+  uint8_t cardType = SD.cardType();
+
+  if (cardType == CARD_NONE)
+  {
+    Serial.println("No SD card attached");
+    return;
+  }
+
+  Serial.print("SD Card Type: ");
+  if (cardType == CARD_MMC)
+  {
+    Serial.println("MMC");
+  }
+  else if (cardType == CARD_SD)
+  {
+    Serial.println("SDSC");
+  }
+  else if (cardType == CARD_SDHC)
+  {
+    Serial.println("SDHC");
+  }
+  else
+  {
+    Serial.println("UNKNOWN");
+  }
+
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+
+  listDir(SD, "/", 0);
+  //createDir(SD, "/mydir");
+  //listDir(SD, "/", 0);
+  //removeDir(SD, "/mydir");
+  //listDir(SD, "/", 2);
+  //writeFile(SD, "/hello.txt", "Hello ");
+  //appendFile(SD, "/hello.txt", "World!\n");
+  //readFile(SD, "/hello.txt");
+  //deleteFile(SD, "/foo.txt");
+  deleteFile(SD, "/logFile.txt");
+  deleteFile(SD, "/logFile1.txt");
+  //renameFile(SD, "/hello.txt", "/foo.txt");
+  //readFile(SD, "/foo.txt");
+  //testFileIO(SD, "/test.txt");
+  //Serial.printf("Total space: %lluMB\n", SD.totalBytes() / (1024 * 1024));
+  //Serial.printf("Used space: %lluMB\n", SD.usedBytes() / (1024 * 1024));
+
+  // Setting up VL6180 ************************************************************
+  //*****************************************************************************
+#ifdef DISTANCE
+#ifdef ADAF
+  Serial.println("Adafruit VL6180x test!");
+  if (!vl.begin())
+  {
+    Serial.println("Failed to find sensor");
+    while (1)
+      ;
+  }
+  Serial.println("Sensor found!");
+
+#else
+  if (!theWire)
+  {
+    _i2c = &Wire;
+  }
+  else
+  {
+    _i2c = theWire;
+  }
+  _i2c->begin();
+
+  Serial.print("Wire statusInit: ");
+  Serial.println(vl1.last_status);
+  vl1.init();
+  Serial.print("Wire statusIn: ");
+  Serial.println(vl1.last_status);
+  vl1.configureDefault();
+  Serial.print("Wire statusdef: ");
+  Serial.println(vl1.last_status);
+
+  // Reduce range max convergence time and ALS integration
+  // time to 30 ms and 50 ms, respectively, to allow 10 Hz
+  // operation (as suggested by Table 6 ("Interleaved mode
+  // limits (10 Hz operation)") in the datasheet).
+  vl1.writeReg(VL6180X::SYSRANGE__MAX_CONVERGENCE_TIME, 30);
+  vl1.writeReg16Bit(VL6180X::SYSALS__INTEGRATION_PERIOD, 50);
+  vl1.writeReg(VL6180X::SYSALS__INTERMEASUREMENT_PERIOD, 100);
+  vl1.writeReg(VL6180X::SYSRANGE__INTERMEASUREMENT_PERIOD, 10);
+  vl1.setTimeout(500);
+  Serial.print("Wire statusTo: ");
+  Serial.println(vl1.last_status);
+
+  // stop continuous mode if already active
+  vl1.stopContinuous();
+  // in case stopContinuous() triggered a single-shot
+  // measurement, wait for it to complete
+  delay(300);
+  vl1.writeReg(VL6180X::SYSTEM__MODE_GPIO1, 0x10);
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x03);
+  Serial.print("Wire status1: ");
+  Serial.println(vl1.last_status);
+  // enable interrupt output on GPIO1
+  // vl1.writeReg(VL6180X::SYSTEM__MODE_GPIO1, 0x30);
+  // // clear any existing interrupts
+
+  uint8_t intr = vl1.readReg(VL6180X::SYSTEM__INTERRUPT_CONFIG_GPIO);
+  intr |= 0x4;
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CONFIG_GPIO, intr);
+  Serial.print("Wire status2: ");
+  Serial.println(vl1.last_status);
+
+  vl1.writeReg16Bit(VL6180X::READOUT__AVERAGING_SAMPLE_PERIOD, 0x10A);
+  Serial.print("Wire status3: ");
+  Serial.println(vl1.last_status);
+
+  // vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CONFIG_GPIO, 0x24);
+  // vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x07);
+  // start interleaved continuous mode with period of 100 ms
+  //vl1.startInterleavedContinuous(100);
+  // vl1.writeReg(VL6180X::INTERLEAVED_MODE__ENABLE, 0);
+
+  // vl1.writeReg(VL6180X::SYSRANGE__START, 0x01);
+  // vl1.writeReg(VL6180X::SYSALS__START, 0x01);
+  // delay(300);
+  // vl1.writeReg(VL6180X::SYSRANGE__START, 0x3);
+  uint8_t rce = vl1.readReg(VL6180X::SYSRANGE__RANGE_CHECK_ENABLES);
+  rce &= 0xFE;
+  vl1.writeReg(VL6180X::SYSRANGE__RANGE_CHECK_ENABLES, rce);
+  Serial.print("Wire status4: ");
+  Serial.println(vl1.last_status);
+
+  Serial.println("Waiting for device...");
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x07);
+  Serial.print("Wire status5: ");
+  Serial.println(vl1.last_status);
+  while (!(vl1.readReg(VL6180X::RESULT__RANGE_STATUS) & 0x01))
+    ;
+  //vl1.startRangeContinuous(100);
+
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x07);
+  Serial.print("Wire status6: ");
+  Serial.println(vl1.last_status);
+  Serial.println("Starting range measurement");
+  vl1.writeReg(VL6180X::SYSRANGE__START, 0x3);
+#endif
+#endif
+// Setting up MPU-6050 ************************************************************
+//*****************************************************************************
+// Try to initialize!
+#ifdef ACCEL
+  if (!mpu.begin())
+  {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1)
+    {
+      delay(10);
+    }
+  }
+  Serial.println("MPU6050 Found!");
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  Serial.print("Accelerometer range set to: ");
+
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  Serial.print("Gyro range set to: ");
+
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.print("Filter bandwidth set to: ");
+#endif
+  // Spawning tasks  ************************************************************
+  //*****************************************************************************
+
+  xMutex = xSemaphoreCreateMutex();
+
+#ifdef SERVER
+  Serial.println("Spawning processServer");
+  xTaskCreatePinnedToCore(
+      processServer,   /* Task function. */
+      "processServer", /* String with name of task. */
+      4096,            /* Stack size in bytes. */
+      NULL,            /* Parameter passed as input of the task */
+      3,               /* Priority of the task. */
+      &hServer, 0);    /* Task handle. */
+#endif
+
+  //   Serial.println("Spawning processSensor");
+  //   xTaskCreatePinnedToCore(
+  //       processSensor,   /* Task function. */
+  //       "processSensor", /* String with name of task. */
+  //       4096,            /* Stack size in bytes. */
+  //       NULL,            /* Parameter passed as input of the task */
+  //       12,              /* Priority of the task. */
+  //       &hSensor, 1);    /* Task handle. */
+}
+
+void loop()
+{
+
+//Copy file
+#if 0
+  int byteCnt = 0;
+  xSemaphoreTake(xMutex, portMAX_DELAY);
+  Serial.println("Loop: taking mutex");
+
+  myFileIn = SD.open("/logFile.txt", FILE_READ);
+  myFileOut = SD.open("/logFile1.txt", FILE_WRITE);
+  if (!myFileIn || !myFileOut)
+  {
+    Serial.print("FileIDs: ");
+    Serial.print(int(myFileIn));
+    Serial.print(int(myFileOut));
+  }
+  while (myFileIn.available())
+  {
+    byteCnt++;
+    Serial.print("Copy byte: ");
+    Serial.println(byteCnt);
+    myFileOut.write(myFileIn.read());
+  }
+  myFileIn.close();
+  myFileOut.close();
+  Serial.println("Loop: releasing mutex");
+  xSemaphoreGive(xMutex);
+#else
+
+#ifdef SAVE_FILE
+  xSemaphoreTake(xMutex, portMAX_DELAY);
+  Serial.println("Loop: taking mutex");
+  logFile = SD.open("/logFile.txt", FILE_APPEND);
+  if (!logFile)
+  {
+    Serial.println("Failed to open file for appending");
+    return;
+  }
+  else
+  {
+    Serial.println("logFile opened");
+  }
+
+  //buf = (uint8_t *)(tmp);
+  memcpy(buf, &logDataDbl, SZ);
+  //buf[SZ] = uint8_t(0);
+  int l;
+  l = logFile.write(buf, SZ);
+  // Serial.print("Written number of bytes: ");
+  // Serial.println(l);
+  // Serial.print("Buffer: ");
+  // for (int i = 0; i < SZ; i++)
+  // {
+  //   Serial.println(buf[i]);
+  // }
+
+  logFile.close();
+  Serial.println("Loop: releasing mutex");
+
+  udp.broadcastTo(ReplyBuffer, 13, 1234);
+
+  xSemaphoreGive(xMutex);
+  vTaskDelay(10);
+#endif
+#endif
+
+  // send a reply, to the IP address and port that sent us the packet we received
+  // udp.beginPacket(remote_IP, 12345);
+  // udp.write(ReplyBuffer, 13);
+  // udp.endPacket();
+
+  //vTaskDelay(100);
+  //delay(10000);
+  // Serial.print("Loop: priority = ");
+  // Serial.println(uxTaskPriorityGet(NULL));
+  // processSensor((void *)(8));
+
+  // if (rangeDataReady())
+  // {
+  //   Serial.print("Range: ");
+  //   Serial.println(readRangeNonBlockingMillimeters());
+  // }
+
+#ifdef ADAF
+  range = vl.readRange();
+  status = vl.readRangeStatus();
+  millis_cur = millis();
+  //Serial.print("Sensor interval: ");
+  Serial.println(millis_cur - millis_last);
+  millis_last = millis_cur;
+  if (status == VL6180X_ERROR_NONE)
+  {
+    Serial.print("Range: ");
+    Serial.println(range);
+  }
+  else
+  {
+    Serial.print("Status:");
+    Serial.println(status);
+  }
+
+#else
+  // //range1 = vl1.readRangeContinuousMillimeters();
+
+#if 0
+  Serial.println("Waiting for range data ready");
+  vl1.writeReg(VL6180X::SYSRANGE__START, 0x01);
+  if (rangeDataReady())
+  {
+    Serial.println("Range data ready");
+    range1 = readRangeNonBlockingMillimeters();
+
+  }
+#endif
+
+#if 0
+  while (! (vl1.readReg(VL6180X::RESULT__RANGE_STATUS) & 0x01));
+  vl1.writeReg(VL6180X::SYSRANGE__START, 0x01);
+  // Serial.print("Wire status: ");
+  // Serial.println(vl1.last_status);
+  delay(5);
+  while (! (vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO) & 0x04));
+  range1 = vl1.readReg(VL6180X::RESULT__RANGE_VAL);
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x07);
+
+  // while (! (vl1.readReg(VL6180X::RESULT__RANGE_STATUS) & 0x01));
+  // vl1.writeReg(VL6180X::SYSRANGE__START, 0x01);
+  // while (!(vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO) & 0x04)) ;
+#endif
+
+#if 0
+  // uint8_t stt = vl1.readReg(VL6180X::RESULT__RANGE_STATUS);
+  // if (stt == 1) {
+  //   vl1.writeReg(VL6180X::SYSRANGE__START, 0x3);
+  // }
+  uint8_t status = vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO);
+  uint8_t ready = (status & 0x04);
+  // uint8_t ret = vl1.readReg(VL6180X::RESULT__RANGE_RETURN_CONV_TIME);
+  // uint8_t sys = vl1.readReg(VL6180X::SYSRANGE__START);
+  // Serial.print("Return: ");
+  // Serial.println(ret);
+  // Serial.print("Sys: ");
+  // Serial.println(sys);
+  // Serial.print("Status :");
+  // Serial.println(status);
+  // Serial.print("Status :");
+  // Serial.println(stt);
+  // Serial.print("Range status: ");
+  // Serial.print(status & 0x0007);
+  // Serial.print(" ALS status: ");
+  // Serial.print((status >> 3) & 0x07);
+  // Serial.print(" Error status: ");
+  // Serial.println((status >> 6) & 0x03);
+  //return ((vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO) & 0x04) != 0);
+  while (ready == 0)
+  {
+    // Serial.print("Return: ");
+    // Serial.println(ret);
+    // Serial.print("Sys: ");
+    // Serial.println(sys);
+    // Serial.print("Status :");
+    // Serial.println(status);
+    // Serial.print("Status :");
+    // Serial.println(stt);
+    // Serial.print("Range status: ");
+    // Serial.print(status & 0x07);
+    // Serial.print(" ALS status: ");
+    // Serial.print((status >> 3) & 0x07);
+    // Serial.print(" Error status: ");
+    // Serial.println((status >> 6) & 0x03);
+    //delay(50);
+    // stt = vl1.readReg(VL6180X::RESULT__RANGE_STATUS);
+    status = vl1.readReg(VL6180X::RESULT__INTERRUPT_STATUS_GPIO);
+    ready = (status & 0x04);
+    // ret = vl1.readReg(VL6180X::RESULT__RANGE_RETURN_CONV_TIME);
+    // sys = vl1.readReg(VL6180X::SYSRANGE__START);
+  }
+  range1 = vl1.readReg(VL6180X::RESULT__RANGE_VAL);
+  vl1.writeReg(VL6180X::SYSTEM__INTERRUPT_CLEAR, 0x07);
+
+  // Serial.print("Return: ");
+  // Serial.println(ret);
+  // Serial.print("Sys: ");
+  // Serial.println(sys);
+  // Serial.print("Status :");
+  // Serial.println(status);
+  // Serial.print("Status :");
+  // Serial.println(stt);
+  // Serial.print("Range status: ");
+  // Serial.print(status & 0x07);
+  // Serial.print(" ALS status: ");
+  // Serial.print((status >> 3) & 0x07);
+  // Serial.print(" Error status: ");
+  // Serial.println((status >> 6) & 0x03);
+
+#endif
+#ifdef DISTANCE
+  if (rangeDataReady())
+  {
+    Serial.println("Range data ready");
+    range1 = readRangeNonBlockingMillimeters();
+  }
+#endif
+#ifdef DISTANCE
+  millis_cur = millis();
+  //Serial.print("Sensor interval: ");
+  Serial.print("Duration: ");
+  Serial.println(millis_cur - millis_last);
+  millis_last = millis_cur;
+  Serial.print("Range: ");
+  Serial.println(range1);
+  if (vl1.timeoutOccurred())
+  {
+    Serial.println(" TIMEOUT");
+  }
+#endif
+#endif
+
+#ifdef ACCEL
+
+
+      millis_cur = millis();
+      //Serial.print("Sensor interval: ");
+      Serial.print("Duration: ");
+      Serial.println(millis_cur - millis_last);
+      millis_last = millis_cur;
+
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+      // a.acceleration.x = 0;
+      // a.acceleration.y = 0;
+      // a.acceleration.z = 0;
+      /* Print out the values */
+      Serial.print("Acceleration X: ");
+      Serial.print(a.acceleration.x);
+      Serial.print(", Y: ");
+      Serial.print(a.acceleration.y);
+      Serial.print(", Z: ");
+      Serial.print(a.acceleration.z);
+      Serial.println(" m/s^2");
+
+      Serial.print("Rotation X: ");
+      Serial.print(g.gyro.x);
+      Serial.print(", Y: ");
+      Serial.print(g.gyro.y);
+      Serial.print(", Z: ");
+      Serial.print(g.gyro.z);
+      Serial.println(" rad/s");
+
+      Serial.print("Temperature: ");
+      Serial.print(temp.temperature);
+      Serial.println(" degC");
+
+#endif
+
+
+
+
+
+}
+
+#ifdef SERVER
+void processServer(void *pvParameters)
+{
+
+  while (1)
+  {
+    Serial.print("server() running on core ");
+    Serial.println(xPortGetCoreID());
+    Serial.println("In process server loop");
+    server.handleClient(); // Listen for client connections
+    vTaskDelay(250);
+    Serial.print("Server priority = ");
+    Serial.println(uxTaskPriorityGet(NULL));
+  }
+}
+#endif
+
+void processSensor(void *pvParameters)
+{
+
+  logger_t curSensor;
+
+  while (1)
+  {
+    if (1)
+    {
+      Serial.println("Sensor: taking mutex");
+    }
+    xSemaphoreTake(xMutex, portMAX_DELAY);
+    for (int counter = 0; counter < SAMPLES; counter++)
+    {
+      if (0)
+      {
+        Serial.print("Loop iteration: ");
+        Serial.println(counter);
+        Serial.print("sensor() running on core ");
+        Serial.println(xPortGetCoreID());
+        Serial.println("In processSensor");
+      }
+
+#ifdef ADAF
+      range = vl.readRange();
+      status = vl.readRangeStatus();
+      millis_cur = millis();
+      //Serial.print("Sensor interval: ");
+      Serial.println(millis_cur - millis_last);
+      millis_last = millis_cur;
+      if (status == VL6180X_ERROR_NONE)
+      {
+        Serial.print("Range: ");
+        Serial.println(range);
+      }
+
+#else
+      //range1 = vl1.readRangeContinuousMillimeters();
+      Serial.println("Waiting for range data ready");
+      if (rangeDataReady())
+      {
+        Serial.println("Range data ready");
+        range1 = readRangeNonBlockingMillimeters();
+      }
+
+      millis_cur = millis();
+      //Serial.print("Sensor interval: ");
+      Serial.print("Duration: ");
+      Serial.println(millis_cur - millis_last);
+      millis_last = millis_cur;
+      Serial.print("Range: ");
+      Serial.println(range1);
+      if (vl1.timeoutOccurred())
+      {
+        Serial.println(" TIMEOUT");
+      }
+#endif
+      /* Get new sensor events with the readings */
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+      // a.acceleration.x = 0;
+      // a.acceleration.y = 0;
+      // a.acceleration.z = 0;
+      // /* Print out the values */
+      // Serial.print("Acceleration X: ");
+      // Serial.print(a.acceleration.x);
+      // Serial.print(", Y: ");
+      // Serial.print(a.acceleration.y);
+      // Serial.print(", Z: ");
+      // Serial.print(a.acceleration.z);
+      // Serial.println(" m/s^2");
+
+      // Serial.print("Rotation X: ");
+      // Serial.print(g.gyro.x);
+      // Serial.print(", Y: ");
+      // Serial.print(g.gyro.y);
+      // Serial.print(", Z: ");
+      // Serial.print(g.gyro.z);
+      // Serial.println(" rad/s");
+
+      // Serial.print("Temperature: ");
+      // Serial.print(temp.temperature);
+      // Serial.println(" degC");
+#ifdef ADAF
+      curSensor.range = float(range);
+#else
+      curSensor.range = float(range1);
+#endif
+      curSensor.x = a.acceleration.x;
+      curSensor.y = a.acceleration.y;
+      curSensor.z = a.acceleration.z;
+
+      logData[counter] = curSensor;
+    }
+
+    for (int cnt = 0; cnt < SAMPLES; cnt++)
+    {
+      logDataDbl[cnt] = logData[cnt];
+    }
+    Serial.println("Sensor: releasing mutex");
+    xSemaphoreGive(xMutex);
+    vTaskDelay(10);
+  }
+}
+
+
